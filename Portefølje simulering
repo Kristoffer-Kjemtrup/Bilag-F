@@ -1,0 +1,728 @@
+{library(readxl)
+library(data.table)
+library(ggplot2)
+library(lubridate)
+library(reshape2)
+library(knitr)
+library(forecast)
+library(tstools)
+library(mFilter)
+library(urca)
+library(tseries)
+library(lmtest)
+library(boot)
+library(latex2exp)
+library(dynlm)
+library(dyn)
+library(MLmetrics)
+library(purrr)
+library(plyr)
+library(IntroCompFinR)
+library(lemon)
+library(knitr)
+library(ggpubr)
+library(scales)
+  }
+
+{VEST <- read.csv("~/Desktop/PBL/6. semester/Vest.csv")
+NOVO <- read.csv("~/Desktop/PBL/6. semester/NOVO-B.CO.csv")
+CARL <- read.csv("~/Desktop/PBL/6. semester/CARL-B.CO.csv")
+FLS <- read.csv("~/Desktop/PBL/6. semester/FLS.CO.csv")
+MAER <- read.csv("~/Desktop/PBL/6. semester/MAERSKA.csv")
+C25 <- read.csv("~/Desktop/PBL/6. semester/OMXC25.csv")
+porfdates = as.Date(VEST[503:555,1])
+lims = c(-1.25, -1.2, -1.15, -1.25, -1.2)
+
+ResNames <- c("Vestas Actual", "Vestas Arima", "Vestas RF", "Novo Actual", "Novo Arima", "Novo RF",
+              "Carl Actual", "Carl Arima", "Carl RF","FLS Actual", "FLS Arima", "FLS RF",
+              "Maersk Actual", "Maersk Arima", "Maersk RF","EQ1", "EQ2", "EQ3", "EQ4", "EQ5",
+              "Vestas Tan", "Novo Tan", "Carl Tan", "FLS Tan", "Maersk Tan",
+              "Vestas Tan_s", "Novo Tan_s", "Carl Tan_s", "FLS Tan_s", "Maersk Tan_s", "C25")
+              
+VEST <- VEST[33:555,6]
+NOVO <- NOVO[33:555,6]
+CARL <- CARL[33:555,6]
+FLS <- FLS[33:555,6]
+MAER <- MAER[33:555,6]
+C25 <- C25[100:159,6]
+stocks <- matrix(ncol= 5, nrow = length(VEST))
+stocksC25 <- matrix(ncol= 5, nrow = length(C25))
+stocksC25[,1:5] <- C25
+stocks[,1] <- VEST; stocks[,2] <- NOVO; stocks[,3] <- CARL; stocks[,4] <- FLS; stocks[,5] <- MAER
+results <- read.csv("resultspct.csv", sep = " ") #resultspct
+results[,16:20]=1
+
+
+tanport <- c(13.5, 42.3, 40.5, 0, 3.7)/100
+tanport_s <- c(0.156, 0.446, 0.487, -0.235, 0.145)
+for (i in 1:5) {results[,i+20] = tanport[i]}
+for (i in 1:5) {results[,i+25] = tanport_s[i]}
+results[,31] = (tail(C25,52)-head(tail(C25,53),52))/head(tail(C25,53),52)
+colnames(results) = ResNames
+}
+
+
+#Function to create weights
+calc_weights <- function(estReturn, limits){
+  initial_w <- numeric(5)
+  adjReturn <- estReturn
+  adjReturnW <- numeric(5)
+  scale = 1
+  PctBreach = numeric(5)
+  prelimWadj <- numeric(5)
+  PostScaling <- numeric(5)
+  WlessBreaches <- numeric(5)
+  FinalW = numeric(5)
+  
+  
+  initial_w = estReturn/sum(estReturn)
+  
+  #get the correct scalation of the estimated returns, such that the sum is no longer negative
+  #Here, we also get new adjusted weights
+  if (sum(estReturn)>0){scale = 0;adjReturnW = initial_w} else {
+    while (-max(initial_w)<min(adjReturnW)){
+      #if (min((estReturn+(abs(estReturn)*(0.5*scale)))/sum((estReturn+(abs(estReturn)*(0.5*scale)))))<(-max(initial_w))){
+        #scale = scale/2}
+      #else{scale = scale-0.0001}
+      adjReturn = estReturn+(abs(estReturn)*scale)
+      adjReturnW = adjReturn/sum(adjReturn)
+      scale = scale-0.0001
+    }
+  }
+  
+  #adjust breaching weights
+  for (i in 1:5) {prelimWadj[i] <- if(adjReturnW[i]<limits[i]){limits[i]} else{0}}
+  
+  #bind together the rescaled weigths with the other weights
+  for (i in 1:5) {
+    PostScaling[i] <- if(adjReturnW[i]<limits[i]){prelimWadj[i]} else{adjReturnW[i]}
+    WlessBreaches[i] <- if(adjReturnW[i]<limits[i]){0} else{adjReturnW[i]}
+  }
+  
+  for (i in 1:5){
+    FinalW[i] <- if(adjReturnW[i]<limits[i]){PostScaling[i]} 
+    else{PostScaling[i]/sum(WlessBreaches)*(1-(sum(PostScaling)-sum(WlessBreaches)))}
+  }
+  
+  
+  
+  return(list(estReturn = estReturn,
+              initial_w = initial_w,
+              scale = scale,
+              adjReturn = adjReturn,
+              adjReturnW = adjReturnW,
+              PctBreach = PctBreach,
+              prelimWadj = prelimWadj,
+              PostScaling = PostScaling,
+              WlessBreaches = WlessBreaches,
+              FinalW = FinalW))
+}
+
+#calc_weights(c(0.2, 0.43, 0.12, -0.6, -0.42), limits = lims)
+
+#No shorting
+run_port_ns <- function(Start_amount = 1000000, n = 52, trans_cost = 0.002, actualpct = results,
+               stockvals = stocks, Type, max_weigth = 3, include_cost = TRUE,
+               equal = FALSE, dates = porfdates, limits = lims, calc_weight = calc_weights){
+  if (!(toupper(Type) %in% c("ARIMA", "RF", "EQ", "TAN"))){
+    return ("Please select among the types; arima, rf, eq or tan")}
+  
+  actual1 <- actualpct[,1] #actual percent change index 1+3i i = 0:4
+  actual2 <- actualpct[,4] 
+  actual3 <- actualpct[,7]
+  actual4 <- actualpct[,10]
+  actual5 <- actualpct[,13]
+  predicted1 <- actualpct[,if(toupper(Type) == "ARIMA"){2} else if(toupper(Type) == "RF"){3} else if(toupper(Type) == "EQ"){16} else if(toupper(Type) == "TAN"){21}]
+  predicted2 <- actualpct[,if(toupper(Type) == "ARIMA"){5} else if(toupper(Type) == "RF"){6} else if(toupper(Type) == "EQ"){17} else if(toupper(Type) == "TAN"){22}]
+  predicted3 <- actualpct[,if(toupper(Type) == "ARIMA"){8} else if(toupper(Type) == "RF"){9} else if(toupper(Type) == "EQ"){18} else if(toupper(Type) == "TAN"){23}]
+  predicted4 <- actualpct[,if(toupper(Type) == "ARIMA"){11} else if(toupper(Type) == "RF"){12} else if(toupper(Type) == "EQ"){19} else if(toupper(Type) == "TAN"){24}]
+  predicted5 <- actualpct[,if(toupper(Type) == "ARIMA"){14} else if(toupper(Type) == "RF"){15} else if(toupper(Type) == "EQ"){20} else if(toupper(Type) == "TAN"){25}]
+  stock1n <- stockvals[,1]
+  stock2n <- stockvals[,2]
+  stock3n <- stockvals[,3]
+  stock4n <- stockvals[,4]
+  stock5n <- stockvals[,5]
+  hold1 <- 0 #Current amount of shares held
+  hold2 <- 0
+  hold3 <- 0
+  hold4 <- 0
+  hold5 <- 0
+  rev <- numeric(n)
+  balance = Start_amount
+  balances <- numeric(n+1)
+  total_preds <- numeric(n)
+  balances[1] <- balance
+  balchg <- numeric(n)
+  amounts <- matrix(ncol= 5, nrow = n)
+  correctb <- matrix(ncol= 5, nrow = n)
+  corrects <- matrix(ncol= 5, nrow = n)
+  fees <- matrix(ncol= 5, nrow = n+1)
+  wts <- matrix(ncol= 6, nrow = n) #weights
+  profits <- matrix(ncol= 6, nrow = n)
+  returns <- matrix(ncol= 5, nrow = n)
+  buys <- matrix(ncol= 5, nrow = n)
+  #Stockn/stockl are numeric and 
+  
+  if (toupper(Type) == "EQ" | toupper(Type) == "TAN"){
+    i= 1
+    predictions = as.numeric(c(predicted1[i], predicted2[i], predicted3[i], predicted4[i], predicted5[i]))
+    total_pred = sum(predictions[1:5])
+    
+    ##Determine amount of shares 
+    #What amount do we want to invest in each
+    Ws = calc_weight(predictions, limits)
+    W = Ws$FinalW
+    amount1 <- balance*W[1]
+    amount2 <- balance*W[2]
+    amount3 <- balance*W[3]
+    amount4 <- balance*W[4]
+    amount5 <- balance*W[5]
+    buy1 <- trunc(amount1/stock1n[(length(stock1n)-n-1+i)]) 
+    buy2 <- trunc(amount2/stock2n[(length(stock2n)-n-1+i)])
+    buy3 <- trunc(amount3/stock3n[(length(stock3n)-n-1+i)])
+    buy4 <- trunc(amount4/stock4n[(length(stock4n)-n-1+i)])
+    buy5 <- trunc(amount5/stock5n[(length(stock5n)-n-1+i)])}
+  
+  ##Trading##
+  for (i in 1:n){
+    if (toupper(Type) == "ARIMA" | toupper(Type) == "RF"){
+    #Find amount to traded
+    predictions = as.numeric(c(predicted1[i], predicted2[i], predicted3[i], predicted4[i], predicted5[i]))
+    predictions[predictions<0] <- 0 #Make negatives 0 because we cannot short sell
+    total_pred = sum(predictions[1:5])
+    
+    ##Determine amount of shares 
+    #What amount do we want to invest in each
+    if (total_pred > 0){
+      Ws = calc_weight(predictions, limits)
+      W = Ws$FinalW
+    amount1 <- balance*W[1]
+    amount2 <- balance*W[2]
+    amount3 <- balance*W[3]
+    amount4 <- balance*W[4]
+    amount5 <- balance*W[5]
+    } else{amount1 = 0; amount2 = 0; amount3 = 0; amount4 = 0; amount5 = 0}
+    
+
+    #how many shares can we buy for that amount
+    buy1 <- trunc(amount1/stock1n[(length(stock1n)-n-1+i)]) 
+    buy2 <- trunc(amount2/stock2n[(length(stock2n)-n-1+i)])
+    buy3 <- trunc(amount3/stock3n[(length(stock3n)-n-1+i)])
+    buy4 <- trunc(amount4/stock4n[(length(stock4n)-n-1+i)])
+    buy5 <- trunc(amount5/stock5n[(length(stock5n)-n-1+i)])}
+    
+    rturn = as.numeric(c((actual1[i])*buy1*stock1n[(length(stock1n)-n+i)], 
+                         (actual2[i])*buy2*stock2n[(length(stock2n)-n+i)], 
+                         (actual3[i])*buy3*stock3n[(length(stock3n)-n+i)],
+                         (actual4[i])*buy4*stock4n[(length(stock4n)-n+i)],
+                         (actual5[i])*buy5*stock5n[(length(stock5n)-n+i)]))
+    
+    Expected_return = as.numeric(c((predicted1[i])*buy1*stock1n[(length(stock1n)-n+i)], 
+                                   (predicted2[i])*buy2*stock2n[(length(stock2n)-n+i)], 
+                                   (predicted3[i])*buy3*stock3n[(length(stock3n)-n+i)],
+                                   (predicted4[i])*buy4*stock4n[(length(stock4n)-n+i)],
+                                   (predicted5[i])*buy5*stock5n[(length(stock5n)-n+i)]))
+    
+    fees[i,1] <- (stock1n[(length(stock1n)-n+i-1)]*trans_cost*(abs(hold1-buy1))/2)
+    fees[i,2] <- (stock2n[(length(stock2n)-n+i-1)]*trans_cost*(abs(hold2-buy2))/2)
+    fees[i,3] <- (stock3n[(length(stock3n)-n+i-1)]*trans_cost*(abs(hold3-buy3))/2)
+    fees[i,4] <- (stock4n[(length(stock4n)-n+i-1)]*trans_cost*(abs(hold4-buy4))/2)
+    fees[i,5] <- (stock5n[(length(stock5n)-n+i-1)]*trans_cost*(abs(hold5-buy5))/2)
+    
+    cost2close = as.numeric(c((stock1n[(length(stock1n)-n+i-1)]*trans_cost*(abs(hold1))/2),
+                              (stock2n[(length(stock2n)-n+i-1)]*trans_cost*(abs(hold2))/2),
+                              (stock3n[(length(stock3n)-n+i-1)]*trans_cost*(abs(hold3))/2),
+                              (stock4n[(length(stock4n)-n+i-1)]*trans_cost*(abs(hold4))/2),
+                              (stock5n[(length(stock5n)-n+i-1)]*trans_cost*(abs(hold5))/2)))
+    
+    if (include_cost==TRUE){
+      if (Expected_return[1]>fees[i,1]){} else if(cost2close[1]>fees[i,1]-Expected_return[1]){} else{amount1 = 0; buy1 = 0; fees[i,1] = cost2close[1]; rturn[1] = 0; predictions[1] = 0}
+      if (Expected_return[2]>fees[i,2]){} else if(cost2close[2]>fees[i,2]-Expected_return[2]){} else{amount2 = 0; buy2 = 0; fees[i,2] = cost2close[2]; rturn[2] = 0; predictions[2] = 0}
+      if (Expected_return[3]>fees[i,3]){} else if(cost2close[3]>fees[i,3]-Expected_return[3]){} else{amount3 = 0; buy3 = 0; fees[i,3] = cost2close[3]; rturn[3] = 0; predictions[3] = 0}
+      if (Expected_return[4]>fees[i,4]){} else if(cost2close[4]>fees[i,4]-Expected_return[4]){} else{amount4 = 0; buy4 = 0; fees[i,4] = cost2close[4]; rturn[4] = 0; predictions[4] = 0}
+      if (Expected_return[5]>fees[i,5]){} else if(cost2close[5]>fees[i,5]-Expected_return[5]){} else{amount5 = 0; buy5 = 0; fees[i,5] = cost2close[5]; rturn[5] = 0; predictions[5] = 0}
+    }
+    
+    
+    if (hold1-buy1>0){rev[i] = rev[i] + abs((hold1-buy1)*stock1n[(length(stock1n)-n+i)])}
+    if (hold2-buy2>0){rev[i] = rev[i] + abs((hold2-buy2)*stock2n[(length(stock1n)-n+i)])}
+    if (hold3-buy3>0){rev[i] = rev[i] + abs((hold3-buy3)*stock3n[(length(stock1n)-n+i)])}
+    if (hold4-buy4>0){rev[i] = rev[i] + abs((hold4-buy4)*stock4n[(length(stock1n)-n+i)])}
+    if (hold5-buy5>0){rev[i] = rev[i] + abs((hold5-buy5)*stock5n[(length(stock1n)-n+i)])}
+    
+    hold1 <- buy1;hold2 <- buy2;hold3 <- buy3;hold4 <- buy4;hold5 <- buy5
+    balance = balance + sum(rturn) - sum(fees[i,])
+    if (i==n){
+      closecost = as.numeric(c((tail(stock1n,1)*abs(hold1)*trans_cost/2)
+                               
+                               
+                               
+                               
+                               , (tail(stock2n,1)*abs(hold2)*trans_cost/2),
+                               (tail(stock3n,1)*abs(hold3)*trans_cost/2), (tail(stock4n,1)*abs(hold4)*trans_cost/2),
+                               (tail(stock5n,1)*abs(hold5)*trans_cost/2)))
+      balance = balance - sum(closecost)
+    }
+    balances[i+1] = balance
+    wts[i,1:5] = W
+    wts[i,6] = sum(W)
+    profits[i,1:5] = rturn[1:5]
+    profits[i,6] = sum(profits[i,1:5])
+    buys[i,1] = buy1; buys[i,2] = buy2; buys[i,3] = buy3; buys[i,4] = buy4; buys[i,5] = buy5
+    total_preds[i] = total_pred
+    amounts[i,1] = amount1; amounts[i,2] = amount2; amounts[i,3] = amount3; amounts[i,4] = amount4; amounts[i,5] = amount5
+    balchg <- (tail(balances, 52) - head(balances, 52))/head(balances, 52)
+    for (j in 1:5){
+      correctb[i,j] = if(W[j]>0 & actualpct[i,1+3*j-3]>0){1} else{0}
+      corrects[i,j] = if(W[j]==0 & actualpct[i,1+3*j-3]<0){1} else{0}
+    }
+  }
+  
+  fees[53,1] = tail(stock1n,1)*abs(hold1)*trans_cost/2
+  fees[53,2] = tail(stock2n,1)*abs(hold2)*trans_cost/2
+  fees[53,3] = tail(stock3n,1)*abs(hold3)*trans_cost/2
+  fees[53,4] = tail(stock4n,1)*abs(hold4)*trans_cost/2
+  fees[53,5] = tail(stock5n,1)*abs(hold5)*trans_cost/2
+  returns = profits[,1:5]-fees[1:n,]
+  returns[52,] = returns[52,] - fees[53,]
+  acc_returns <- matrix(ncol= 5, nrow = n)
+  for(j in 1:5){acc_returns[1:52,j] <- cumsum(returns[1:52,j])}
+  
+  #Making plots
+  plotdata <- data.frame(Dato = dates, Værdi = balances)
+  returnplot <- ggplot(plotdata, aes(Dato, Værdi, group = 1)) +
+    geom_line() +
+    scale_y_continuous('Værdi i kr.', limits=c(min(balances)-2000, max(balances)+2000)) +
+    theme_minimal()
+  
+  
+  Stockreturnsdata = data.frame(Stock = rep(c("Vestas", "Novo Nordisk", "Carlsberg", "FLSmidth", "Mærsk"), each = n),
+                                Dato = c(dates[-1], dates[-1], dates[-1], dates[-1], dates[-1]),
+                                Værdi = c(acc_returns[,1], acc_returns[,2], acc_returns[,3], acc_returns[,4], acc_returns[,5]))
+  Stockreturnsdata <- arrange(Stockreturnsdata, Dato, Stock) 
+  
+  Stockreturns <- ggplot(Stockreturnsdata) +
+    geom_line(aes(x=Dato, y = Værdi, color = Stock)) +
+    scale_y_continuous('Værdi i kr.', limits=c(min(acc_returns)-2000, max(acc_returns)+2000)) +
+    theme_light()
+  
+  
+  
+  barplotdata <- data.frame(Aktie = rep(c("Vestas", "Novo Nordisk", "Carlsberg", "FLSmidth", "Maersk"), each = n),
+                            Dato = c(dates[-1], dates[-1], dates[-1], dates[-1], dates[-1]),
+                            Vægt = c(wts[,1], wts[,2], wts[,3], wts[,4], wts[,5]))
+  
+  barplotdata <- arrange(barplotdata, Dato, Aktie) 
+  barplotdata <- ddply(barplotdata, "Dato",
+                       transform, label_ypos=cumsum(Vægt))
+  
+  barplot <- ggplot(data=barplotdata, aes(x=Dato, y=Vægt, fill=Aktie)) +
+    geom_bar(stat="identity")+
+    scale_fill_brewer(palette="Paired")+
+    theme_minimal() + 
+    theme(legend.position="bottom")
+  
+
+  return(list(balance = balance,
+              balances = balances,
+              weights = wts,
+              returns = returns,
+              acc_returns = acc_returns,
+              buys = buys,
+              cost2close = cost2close,
+              total_preds = total_preds,
+              amounts = amounts,
+              fees = fees,
+              rev = rev,
+              correctb = correctb,
+              corrects = corrects,
+              profits = profits,
+              balchg = balchg,
+              returnplot = returnplot,
+              barplot = barplot,
+              Stockreturns = Stockreturns))
+}
+
+
+
+#Shorting allowed
+run_port_s <- function(Start_amount = 1000000, n = 52, trans_cost = 0.002, actualpct = results,
+              stockvals = stocks, Type, max_weigth = 300, short_fee = 0.04, 
+              include_cost = TRUE, dates = porfdates, limits = lims, calc_weight = calc_weights){
+  if (!(toupper(Type) %in% c("ARIMA", "RF", "EQ", "TAN"))){
+    return ("Please select among the types; arima, rf, eq or tan")}
+  actual1 <- actualpct[,1] #actual percent change
+  actual2 <- actualpct[,4]
+  actual3 <- actualpct[,7]
+  actual4 <- actualpct[,10]
+  actual5 <- actualpct[,13]
+  predicted1 <- actualpct[,if(toupper(Type) == "ARIMA"){2} else if(toupper(Type) == "RF"){3} else if(toupper(Type) == "EQ"){16} else if(toupper(Type) == "TAN"){26}]
+  predicted2 <- actualpct[,if(toupper(Type) == "ARIMA"){5} else if(toupper(Type) == "RF"){6} else if(toupper(Type) == "EQ"){17} else if(toupper(Type) == "TAN"){27}]
+  predicted3 <- actualpct[,if(toupper(Type) == "ARIMA"){8} else if(toupper(Type) == "RF"){9} else if(toupper(Type) == "EQ"){18} else if(toupper(Type) == "TAN"){28}]
+  predicted4 <- actualpct[,if(toupper(Type) == "ARIMA"){11} else if(toupper(Type) == "RF"){12} else if(toupper(Type) == "EQ"){19} else if(toupper(Type) == "TAN"){29}]
+  predicted5 <- actualpct[,if(toupper(Type) == "ARIMA"){14} else if(toupper(Type) == "RF"){15} else if(toupper(Type) == "EQ"){20} else if(toupper(Type) == "TAN"){30}]
+  stock1n <- stockvals[,1]
+  stock2n <- stockvals[,2]
+  stock3n <- stockvals[,3]
+  stock4n <- stockvals[,4]
+  stock5n <- stockvals[,5]
+  hold1 <- 0 #Current amount of shares held
+  hold2 <- 0
+  hold3 <- 0
+  hold4 <- 0
+  hold5 <- 0
+  rev <- numeric(n)
+  balance = Start_amount
+  balances <- numeric(n+1)
+  balchg <- numeric(n)
+  total_preds <- numeric(n)
+  balances[1] <- balance
+  amounts <- matrix(ncol= 5, nrow = n)
+  correctb <- matrix(ncol= 5, nrow = n)
+  corrects <- matrix(ncol= 5, nrow = n)
+  fees <- matrix(ncol= 5, nrow = n+1)
+  wts <- matrix(ncol= 6, nrow = n) #weights
+  profits <- matrix(ncol= 6, nrow = n)
+  returns <- matrix(ncol= 5, nrow = n)
+  buys <- matrix(ncol= 5, nrow = n)
+  #Stockn/stockl are numeric and 
+  
+  if (toupper(Type) == "EQ" | toupper(Type) == "TAN"){
+    predictions = as.numeric(c(predicted1[1], predicted2[1], predicted3[1], predicted4[1], predicted5[1]))
+    total_pred = sum(predictions[1:5])
+    
+    ##Determine amount of shares 
+    #What amount do we want to invest in each
+    Ws = calc_weight(predictions, limits)
+    W = Ws$FinalW
+    amount1 <- balance*W[1]
+    amount2 <- balance*W[2]
+    amount3 <- balance*W[3]
+    amount4 <- balance*W[4]
+    amount5 <- balance*W[5]
+    buy1 <- trunc(amount1/stock1n[(length(stock1n)-n-1+1)]) 
+    buy2 <- trunc(amount2/stock2n[(length(stock2n)-n-1+1)])
+    buy3 <- trunc(amount3/stock3n[(length(stock3n)-n-1+1)])
+    buy4 <- trunc(amount4/stock4n[(length(stock4n)-n-1+1)])
+    buy5 <- trunc(amount5/stock5n[(length(stock5n)-n-1+1)])}
+  
+  ##Trading##
+  for (i in 1:n){
+    if (toupper(Type) == "ARIMA" | toupper(Type) == "RF"){
+    #Find amount to traded
+    predictions = as.numeric(c(predicted1[i], predicted2[i], predicted3[i], predicted4[i], predicted5[i]))
+    total_pred = sum(predictions[1:5])
+    
+    ##Determine amount of shares 
+    #What amount do we want to invest in each
+    Ws = calc_weight(predictions, limits)
+    W = Ws$FinalW
+    amount1 <- balance*W[1]
+    amount2 <- balance*W[2]
+    amount3 <- balance*W[3]
+    amount4 <- balance*W[4]
+    amount5 <- balance*W[5]
+    #how many shares can we buy for that amount
+    buy1 <- trunc(amount1/stock1n[(length(stock1n)-n-1+i)]) 
+    buy2 <- trunc(amount2/stock2n[(length(stock2n)-n-1+i)])
+    buy3 <- trunc(amount3/stock3n[(length(stock3n)-n-1+i)])
+    buy4 <- trunc(amount4/stock4n[(length(stock4n)-n-1+i)])
+    buy5 <- trunc(amount5/stock5n[(length(stock5n)-n-1+i)])}
+    
+    rturn = as.numeric(c((actual1[i])*buy1*stock1n[(length(stock1n)-n+i)], 
+                         (actual2[i])*buy2*stock2n[(length(stock2n)-n+i)], 
+                         (actual3[i])*buy3*stock3n[(length(stock3n)-n+i)],
+                         (actual4[i])*buy4*stock4n[(length(stock4n)-n+i)],
+                         (actual5[i])*buy5*stock5n[(length(stock5n)-n+i)]))
+    
+    Expected_return = as.numeric(c((predicted1[i])*buy1*stock1n[(length(stock1n)-n+i)], 
+                                   (predicted2[i])*buy2*stock2n[(length(stock2n)-n+i)], 
+                                   (predicted3[i])*buy3*stock3n[(length(stock3n)-n+i)],
+                                   (predicted4[i])*buy4*stock4n[(length(stock4n)-n+i)],
+                                   (predicted5[i])*buy5*stock5n[(length(stock5n)-n+i)]))
+                       
+    fees[i,1] <- (stock1n[(length(stock1n)-n+i-1)]*trans_cost*(abs(hold1-buy1))/2)+((stock1n[(length(stock1n)-n+i-1)]*(short_fee/52)*(if(buy1<hold1 & hold1<0){abs(hold1-buy1)} else if(buy1<0){abs(buy1)} else{0})) + if(buy1<0 & buy1<hold1){250} else{0})
+    fees[i,2] <- (stock2n[(length(stock2n)-n+i-1)]*trans_cost*(abs(hold2-buy2))/2)+((stock2n[(length(stock2n)-n+i-1)]*(short_fee/52)*(if(buy2<hold2 & hold2<0){abs(hold2-buy2)} else if(buy2<0){abs(buy2)} else{0})) + if(buy2<0 & buy2<hold2){250} else{0})
+    fees[i,3] <- (stock3n[(length(stock3n)-n+i-1)]*trans_cost*(abs(hold3-buy3))/2)+((stock3n[(length(stock3n)-n+i-1)]*(short_fee/52)*(if(buy3<hold3 & hold3<0){abs(hold3-buy3)} else if(buy3<0){abs(buy3)} else{0})) + if(buy3<0 & buy3<hold3){250} else{0})
+    fees[i,4] <- (stock4n[(length(stock4n)-n+i-1)]*trans_cost*(abs(hold4-buy4))/2)+((stock4n[(length(stock4n)-n+i-1)]*(short_fee/52)*(if(buy4<hold4 & hold4<0){abs(hold4-buy4)} else if(buy4<0){abs(buy4)} else{0})) + if(buy4<0 & buy4<hold4){250} else{0})
+    fees[i,5] <- (stock5n[(length(stock5n)-n+i-1)]*trans_cost*(abs(hold5-buy5))/2)+((stock5n[(length(stock5n)-n+i-1)]*(short_fee/52)*(if(buy5<hold5 & hold5<0){abs(hold5-buy5)} else if(buy5<0){abs(buy5)} else{0})) + if(buy5<0 & buy5<hold5){250} else{0})
+    
+    cost2close = as.numeric(c((stock1n[(length(stock1n)-n+i-1)]*trans_cost*(abs(hold1))/2),
+                              (stock2n[(length(stock2n)-n+i-1)]*trans_cost*(abs(hold2))/2),
+                              (stock3n[(length(stock3n)-n+i-1)]*trans_cost*(abs(hold3))/2),
+                              (stock4n[(length(stock4n)-n+i-1)]*trans_cost*(abs(hold4))/2),
+                              (stock5n[(length(stock5n)-n+i-1)]*trans_cost*(abs(hold5))/2)))
+    
+    if (include_cost==TRUE){
+    if (Expected_return[1]>fees[i,1]){} else if(cost2close[1]>fees[i,1]-Expected_return[1]){} else{amount1 = 0; buy1 = 0; fees[i,1] = cost2close[1]; rturn[1] = 0; predictions[1] = 0}
+    if (Expected_return[2]>fees[i,2]){} else if(cost2close[2]>fees[i,2]-Expected_return[2]){} else{amount2 = 0; buy2 = 0; fees[i,2] = cost2close[2]; rturn[2] = 0; predictions[2] = 0}
+    if (Expected_return[3]>fees[i,3]){} else if(cost2close[3]>fees[i,3]-Expected_return[3]){} else{amount3 = 0; buy3 = 0; fees[i,3] = cost2close[3]; rturn[3] = 0; predictions[3] = 0}
+    if (Expected_return[4]>fees[i,4]){} else if(cost2close[4]>fees[i,4]-Expected_return[4]){} else{amount4 = 0; buy4 = 0; fees[i,4] = cost2close[4]; rturn[4] = 0; predictions[4] = 0}
+    if (Expected_return[5]>fees[i,5]){} else if(cost2close[5]>fees[i,5]-Expected_return[5]){} else{amount5 = 0; buy5 = 0; fees[i,5] = cost2close[5]; rturn[5] = 0; predictions[5] = 0}
+    }
+      
+    if (hold1-buy1>0){rev[i] = rev[i] + abs((hold1-buy1)*stock1n[(length(stock1n)-n+i)])}
+    if (hold2-buy2>0){rev[i] = rev[i] + abs((hold2-buy2)*stock2n[(length(stock1n)-n+i)])}
+    if (hold3-buy3>0){rev[i] = rev[i] + abs((hold3-buy3)*stock3n[(length(stock1n)-n+i)])}
+    if (hold4-buy4>0){rev[i] = rev[i] + abs((hold4-buy4)*stock4n[(length(stock1n)-n+i)])}
+    if (hold5-buy5>0){rev[i] = rev[i] + abs((hold5-buy5)*stock5n[(length(stock1n)-n+i)])}
+    hold1 <- buy1;hold2 <- buy2;hold3 <- buy3;hold4 <- buy4;hold5 <- buy5
+    balance = balance + sum(rturn) - sum(fees[i,])
+    if (i==n){
+      closecost = as.numeric(c((tail(stock1n,1)*abs(hold1)*trans_cost/2), (tail(stock2n,1)*abs(hold2)*trans_cost/2),
+        (tail(stock3n,1)*abs(hold3)*trans_cost/2), (tail(stock4n,1)*abs(hold4)*trans_cost/2),
+        (tail(stock5n,1)*abs(hold5)*trans_cost/2)))
+      balance = balance - sum(closecost)
+    }
+    balances[i+1] = balance
+    wts[i,1:5] = W
+    wts[i,6] = sum(W)
+    profits[i,1:5] = rturn[1:5]
+    profits[i,6] = sum(profits[i,1:5])
+    buys[i,1] = buy1; buys[i,2] = buy2; buys[i,3] = buy3; buys[i,4] = buy4; buys[i,5] = buy5
+    total_preds[i] = total_pred
+    amounts[i,1] = amount1; amounts[i,2] = amount2; amounts[i,3] = amount3; amounts[i,4] = amount4; amounts[i,5] = amount5
+  balchg <- (tail(balances, 52) - head(balances, 52))/head(balances, 52)
+  for (j in 1:5){
+  correctb[i,j] = if(W[j]>0 & actualpct[i,1+3*j-3]>0){1} else{0}
+  corrects[i,j] = if(W[j]<0 & actualpct[i,1+3*j-3]<0){1} else{0}
+  }
+  }
+  
+  fees[53,1] = tail(stock1n,1)*abs(hold1)*trans_cost/2
+  fees[53,2] = tail(stock2n,1)*abs(hold2)*trans_cost/2
+  fees[53,3] = tail(stock3n,1)*abs(hold3)*trans_cost/2
+  fees[53,4] = tail(stock4n,1)*abs(hold4)*trans_cost/2
+  fees[53,5] = tail(stock5n,1)*abs(hold5)*trans_cost/2
+  returns = profits[,1:5]-fees[1:n,]
+  returns[52,] = returns[52,] - fees[53,]
+  acc_returns <- matrix(ncol= 5, nrow = n)
+  for(j in 1:5){acc_returns[1:52,j] <- cumsum(returns[1:52,j])}
+  
+  #Making plots
+  plotdata <- data.frame(Dato = dates, Værdi = balances)
+  returnplot <- ggplot(plotdata, aes(Dato, Værdi, group = 1)) +
+    geom_line() +
+    scale_y_continuous('Værdi i kr.', limits=c(min(balances)-2000, max(balances)+2000)) +
+    theme_minimal()
+  
+  Stockreturnsdata = data.frame(Stock = rep(c("Vestas", "Novo Nordisk", "Carlsberg", "FLSmidth", "Mærsk"), each = n),
+                                Dato = c(dates[-1], dates[-1], dates[-1], dates[-1], dates[-1]),
+                                Værdi = c(acc_returns[,1], acc_returns[,2], acc_returns[,3], acc_returns[,4], acc_returns[,5]))
+  Stockreturnsdata <- arrange(Stockreturnsdata, Dato, Stock) 
+  
+  Stockreturns <- ggplot(Stockreturnsdata) +
+    geom_line(aes(x=Dato, y = Værdi, color = Stock)) +
+    scale_y_continuous('Værdi i kr.', limits=c(min(acc_returns)-2000, max(acc_returns)+2000)) +
+    theme_light()
+  
+  
+  barplotdata <- data.frame(Aktie = rep(c("Vestas", "Novo Nordisk", "Carlsberg", "FLSmidth", "Maersk"), each = n),
+                            Dato = c(dates[-1], dates[-1], dates[-1], dates[-1], dates[-1]),
+                            Vægt = c(wts[,1], wts[,2], wts[,3], wts[,4], wts[,5]))
+  
+  barplotdata <- arrange(barplotdata, Dato, Aktie) 
+  barplotdata <- ddply(barplotdata, "Dato",
+                       transform, label_ypos=cumsum(Vægt))
+  
+  barplot <- ggplot(data=barplotdata, aes(x=Dato, y=Vægt, fill=Aktie)) +
+    geom_bar(stat="identity") +
+    scale_fill_brewer(palette="Paired") +
+    theme_minimal() +
+    theme(legend.position='bottom')
+  
+  return(list(balance = balance,
+              balances = balances,
+              weights = wts,
+              returns = returns,
+              acc_returns = acc_returns,
+              buys = buys,
+              total_preds = total_preds,
+              amounts = amounts,
+              fees = fees,
+              rev = rev,
+              hold3 = hold3,
+              balchg = balchg,
+              closecost = closecost,
+              cost2close = cost2close,
+              correctb = correctb,
+              corrects = corrects,
+              profits = profits,
+              returnplot = returnplot,
+              barplot = barplot,
+              Stockreturns = Stockreturns))
+}
+
+
+
+
+#Noshorting portfolios
+ARIMA_port_ns <- run_port_ns(Type = "arima")
+RF_port_ns <- run_port_ns(Type = "rf")
+EQ_port_ns <- run_port_ns(Type = "eq", include_cost = FALSE)
+Tan_port_ns <- run_port_ns(Type = "tan", include_cost = FALSE)
+
+
+#Shorting portfolios
+ARIMA_port_s <- run_port_s(Type = "arima", trans_cost = 0.0008)
+RF_port_s <- run_port_s(Type = "rf", trans_cost = 0.0008)
+EQ_port_s <- run_port_s(Type = "eq", include_cost = FALSE)
+Tan_port_s <- run_port_s(Type = "tan", include_cost = FALSE)
+
+
+
+one_stock_port <- function(Start_amount = 1000000, n = 52, trans_cost = 0.002, actualpct = results,
+                       stockvals = stocks, Type, max_weigth = 300, short_fee = 0.04, stock,
+                       include_cost = TRUE, dates = porfdates, limits = lims, Shorting = TRUE,
+                       allowd = c("VEST", "NOVO", "CARL", "FLS", "MAER")){
+  if (!(toupper(Type) %in% c("ARIMA", "RF", "EQ"))){
+    return ("Please select among the types; arima, rf or eq")}
+  if (!(toupper(stock) %in% allowd)){
+    return ("Please select among the stocks; VEST, NOVO, CARL, FLS or MAER")}
+  
+  actual1 <- actualpct[,(which(allowd %in% stock)-1)*3+1] #actual percent change
+  predicted1 <- actualpct[,if(toupper(Type) == "EQ"){16} else (((which(allowd %in% stock)-1)*3+1)+(if(toupper(Type)== "ARIMA"){1} else if(toupper(Type)== "RF"){2}))]
+  stock1n <- stockvals[,which(allowd %in% stock)]
+  hold1 <- 0 #Current amount of shares held
+  rev <- numeric(n)
+  balance = Start_amount
+  balances <- numeric(n+1)
+  balchg <- numeric(n)
+  total_preds <- numeric(n)
+  balances[1] <- balance
+  amounts <- matrix(ncol= 1, nrow = n)
+  correctb <- matrix(ncol= 1, nrow = n)
+  corrects <- matrix(ncol= 1, nrow = n)
+  fees <- matrix(ncol= 1, nrow = n+1)
+  wts <- matrix(ncol= 1, nrow = n) #weights
+  profits <- matrix(ncol= 1, nrow = n)
+  returns <- matrix(ncol= 1, nrow = n)
+  buys <- matrix(ncol= 1, nrow = n)
+  #Stockn/stockl are numeric and 
+  
+  if (toupper(Type) == "EQ"){
+    predictions = as.numeric(predicted1[1])
+    if (Shorting == FALSE & predictions<0){predictions = 0}
+    total_pred = predictions
+    
+    ##Determine amount of shares 
+    #What amount do we want to invest in each
+    W = 1
+    amount1 <- balance*W
+    buy1 <- trunc(amount1/stock1n[(length(stock1n)-n)])}
+  
+  ##Trading##
+  for (i in 1:n){
+    if (toupper(Type) == "ARIMA" | toupper(Type) == "RF"){
+      #Find amount to traded
+      predictions = as.numeric(predicted1[i])
+      total_pred = predictions
+      if (Shorting == FALSE & predictions<0){predictions = 0}
+      
+      ##Determine amount of shares 
+      #What amount do we want to invest in each
+      W = if(predictions>0){1} else if(predictions<0){limits[which(allowd %in% stock)]} else 0
+      amount1 <- balance*W
+      
+      #how many shares can we buy for that amount
+      buy1 <- trunc(amount1/stock1n[(length(stock1n)-n-1+i)]) }
+    
+    rturn = as.numeric((actual1[i])*buy1*stock1n[(length(stock1n)-n+i)])
+    
+    Expected_return = as.numeric((predicted1[i])*buy1*stock1n[(length(stock1n)-n+i)])
+    
+    fees[i] <- (stock1n[(length(stock1n)-n+i-1)]*trans_cost*(abs(hold1-buy1))/2)+((stock1n[(length(stock1n)-n+i-1)]*(short_fee/52)*(if(buy1<hold1 & hold1<0){abs(hold1-buy1)} else if(buy1<0){abs(buy1)} else{0})) + if(buy1<0 & buy1<hold1){250} else{0})
+    
+    cost2close = as.numeric((stock1n[(length(stock1n)-n+i-1)]*trans_cost*(abs(hold1))/2))
+    
+    if (include_cost==TRUE){
+      if (Expected_return[1]>fees[i,1]){} else if(cost2close[1]>fees[i,1]-Expected_return[1]){} else{amount1 = 0; buy1 = 0; fees[i,1] = cost2close[1]; rturn[1] = 0; predictions[1] = 0}
+     }
+    
+    if (hold1-buy1>0){rev[i] = rev[i] + abs((hold1-buy1)*stock1n[(length(stock1n)-n+i)])}
+    
+    hold1 <- buy1
+    balance = balance + sum(rturn) - sum(fees[i,])
+    if (i==n){
+      balance = balance - (tail(stock1n,1)*abs(hold1)*trans_cost/2)
+    }
+    balances[i+1] = balance
+    wts[i] = W
+    profits[i] = rturn
+    buys[i] = buy1
+    total_preds[i] = total_pred
+    amounts[i] = amount1
+    balchg <- (tail(balances, 52) - head(balances, 52))/head(balances, 52)
+    
+      correctb[i] = if(W>0 & actualpct[i,which(allowd %in% stock)]>0){1} else{0}
+      corrects[i] = if(W<0 & actualpct[i,which(allowd %in% stock)]<0){1} else{0}
+    
+  }
+  
+  fees[53] = tail(stock1n,1)*abs(hold1)*trans_cost/2
+  returns = profits-fees[1:n]
+  returns[52] = returns[52] - fees[53]
+  acc_returns <- matrix(ncol= 1, nrow = n)
+  acc_returns <- cumsum(returns)
+
+  
+  return(list(balance = balance,
+              balances = balances,
+              weights = wts,
+              returns = returns,
+              acc_returns = acc_returns,
+              buys = buys,
+              total_preds = total_preds,
+              amounts = amounts,
+              fees = fees,
+              rev = rev,
+              balchg = balchg,
+              correctb = correctb,
+              corrects = corrects,
+              profits = profits))
+}
+
+
+VEST_EQ <- one_stock_port(Type = "EQ", stock = "VEST", include_cost = FALSE)
+VEST_ARns <- one_stock_port(Type = "ARIMA", stock = "VEST", Shorting = FALSE)
+VEST_ARs <- one_stock_port(Type = "ARIMA", stock = "VEST", trans_cost = 0.0008)
+VEST_RFns <- one_stock_port(Type = "RF", stock = "VEST", Shorting = FALSE)
+VEST_RFs <- one_stock_port(Type = "RF", stock = "VEST")
+
+NOVO_EQ <- one_stock_port(Type = "EQ", stock = "NOVO", include_cost = FALSE)
+NOVO_ARns <- one_stock_port(Type = "ARIMA", stock = "NOVO", Shorting = FALSE)
+NOVO_ARs <- one_stock_port(Type = "ARIMA", stock = "NOVO")
+NOVO_RFns <- one_stock_port(Type = "RF", stock = "NOVO", Shorting = FALSE)
+NOVO_RFs <- one_stock_port(Type = "RF", stock = "NOVO")
+
+CARL_EQ <- one_stock_port(Type = "EQ", stock = "CARL", include_cost = FALSE)
+CARL_ARns <- one_stock_port(Type = "ARIMA", stock = "CARL", Shorting = FALSE)
+CARL_ARs <- one_stock_port(Type = "ARIMA", stock = "CARL")
+CARL_RFns <- one_stock_port(Type = "RF", stock = "CARL", Shorting = FALSE)
+CARL_RFs <- one_stock_port(Type = "RF", stock = "CARL")
+
+FLS_EQ <- one_stock_port(Type = "EQ", stock = "FLS", include_cost = FALSE)
+FLS_ARns <- one_stock_port(Type = "ARIMA", stock = "FLS", Shorting = FALSE)
+FLS_ARs <- one_stock_port(Type = "ARIMA", stock = "FLS")
+FLS_RFns <- one_stock_port(Type = "RF", stock = "FLS", Shorting = FALSE)
+FLS_RFs <- one_stock_port(Type = "RF", stock = "FLS")
+
+MAER_EQ <- one_stock_port(Type = "EQ", stock = "MAER", include_cost = FALSE)
+MAER_ARns <- one_stock_port(Type = "ARIMA", stock = "MAER", Shorting = FALSE)
+MAER_ARs <- one_stock_port(Type = "ARIMA", stock = "MAER")
+MAER_RFns <- one_stock_port(Type = "RF", stock = "MAER", Shorting = FALSE)
+MAER_RFs <- one_stock_port(Type = "RF", stock = "MAER")
+
+
+
+#F_VEST_ARIMAns = var.test(VEST_ARns$profits, VEST_EQ$profits, alternative = "two.sided")$p.value
+F_VEST_ARIMAs = var.test(VEST_ARs$profits, VEST_EQ$profits, alternative = "two.sided")$p.value
+#F_VEST_RFns = var.test(VEST_RFns$profits, VEST_EQ$profits, alternative = "two.sided")$p.value
+F_VEST_RFs = var.test(VEST_RFs$profits, VEST_EQ$profits, alternative = "two.sided")$p.value
+
+T_VEST_ARns = t.test(x = VEST_ARns$profits, y = VEST_EQ$profits, var.equal = FALSE, alternative = "g", paired = FALSE)$p.value
+T_VEST_ARs = t.test(x = VEST_ARs$profits, y = VEST_EQ$profits, var.equal = TRUE, alternative = "g", paired = FALSE)$p.value
+T_VEST_RFns = t.test(x = VEST_RFns$profits, y = VEST_EQ$profits, var.equal = FALSE, alternative = "g", paired = FALSE)$p.value
+T_VEST_RFs = t.test(x = VEST_RFs$profits, y = VEST_EQ$profits, var.equal = TRUE, alternative = "g", paired = FALSE)$p.value
+
+

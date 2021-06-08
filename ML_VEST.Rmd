@@ -1,0 +1,323 @@
+---
+title: "Machine_Learning_Bachelor"
+author: "Martin Skafte Andersen"
+date: "9-12-2020"
+output:
+  html_notebook:
+    code_folding: show
+    df_print: paged
+    theme: flatly
+    toc: yes
+    toc_depth: 4
+    toc_float:
+      collapsed: no
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '2'
+---
+
+```{r setup, include=FALSE}
+### Generic preamble
+rm(list=ls())
+Sys.setenv(LANG = "en")
+options(scipen = 5)
+
+library(knitr)
+knitr::opts_chunk$set(warning=FALSE,
+                     message=FALSE,
+                     comment=FALSE, 
+                     fig.align="center"
+                     )
+```
+
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(Boruta)
+library(caret)
+library(magrittr)
+library(data.table)
+library(tidymodels)
+library(tidyquant) # For getting stock data
+library(ggpubr) #package that helps mixing multiple plots on the same page
+```
+
+# Introduction and data
+
+
+```{r}
+novo <- read.csv("C:/Users/Marti/OneDrive - Aalborg Universitet/6. semester/Bachelor/Data_bachelor/vest.csv")
+
+
+
+y <- novo$Adj.Close
+y <- (y[-1]-y[-length(y)])/y[-length(y)]
+
+novo = novo[2:nrow(novo),] %>%
+  add_column(y)
+
+Stock <- novo
+#growth.adj = log(Stock$Adj.Close)-log(lag(Stock$Adj.Close,1))
+#Stock = cbind(Stock,growth.adj)
+MA10 = rollmean(Stock$y, 2 )
+Stock <- Stock[2:nrow(Stock),]
+Stock = cbind(Stock,MA10)
+
+
+Stock %<>%
+  add_column(high_minus_low = Stock$High - Stock$Low) %>%
+  add_column(open_minus_close = Stock$Close - Stock$Open) %>%
+  #add_column(Momentum = Stock$Open-lag(Stock$Close,2)) #%>%
+  select(-c(Volume, Open, Close,High, Low,Adj.Close))
+```
+
+
+## Data exploration
+
+To investigate the data and the class of the variables a `glimpse()` of the data is shown. 
+
+```{r}
+Stock %>% glimpse()
+```
+
+Merging the data sets together and renaming the variables to show where the closing price came from.
+```{r}
+data <- Stock
+```
+
+
+
+For the supervised machine learning variable inputs are scaled since it's best practice.
+```{r}
+#data$Close %<>% scale(center = FALSE, scale = TRUE)
+#data$Open %<>% scale(center = FALSE, scale = TRUE)
+#data$High %<>% scale(center = FALSE, scale = TRUE)
+#data$Low %<>% scale(center = FALSE, scale = TRUE)
+#data$Volume %<>% scale(center = FALSE, scale = TRUE)
+#data$Adj.Close %<>% scale(center = FALSE, scale = TRUE)
+#data$growth.adj %<>% scale(center = FALSE, scale = TRUE)
+data$open_minus_close %<>% scale(center = FALSE, scale = TRUE)
+#data$Momentum %<>% scale(center = FALSE, scale = TRUE)
+data$high_minus_low %<>% scale(center = FALSE, scale = TRUE)
+data$MA10 %<>% scale(center = FALSE, scale = TRUE)
+
+#att1 <- attr(data$Adj.Close, 'scaled:scale')
+
+
+
+
+#data$Close %<>% as.numeric()
+#data$Open %<>% as.numeric()
+#data$High %<>% as.numeric()
+#data$Low %<>% as.numeric()
+#data$Volume %<>% as.numeric()
+# data$Adj.Close %<>% as.numeric()
+data$MA10 %<>% as.numeric()
+data$open_minus_close %<>% as.numeric()
+data$high_minus_low %<>% as.numeric()
+#data$Momentum %<>% as.numeric()
+#data$growth.adj %<>% as.numeric()
+
+
+```
+
+
+# Supervised Machine Learning
+
+## Preprocessing
+
+
+```{r}
+data_sup <- data %>%
+  select(-Date) %>%
+  mutate(Y = y %>% lead(1)) %>%
+  mutate(Y = ifelse(is.na(Y), lag(Y, 1), Y)) %>%
+  relocate(Y)
+#For the most recent observation the price of Apple and Appletomorrow are identical
+```
+
+## Splitting the data
+
+The data is split into a training set consisting of 80 percent of the data while the remaining 20 percent is test data. 
+```{r}
+actual <- tail(data_sup[1:552,], 52) 
+data_sup <- data_sup[32:500,]
+  
+data_split_sup <- data_sup %>% initial_time_split(prop = 0.80)
+
+data_train_sup <- data_split_sup %>% training()
+data_test_sup <- data_split_sup %>% testing()
+
+
+
+  
+
+
+```
+
+```{r}
+data_recipe <- data_train_sup %>%
+  recipe(Y  ~.) 
+
+
+```
+
+
+## Defining the model
+
+```{r}
+set.seed(1337)
+
+
+
+#Random forest model
+model_rf <- rand_forest(mode = 'regression',
+                        trees = 500, 
+                        mtry = tune(),
+                        min_n = tune()
+                        ) %>%
+  set_engine('ranger', importance = 'impurity')
+
+
+
+ 
+```
+
+A general workflow along with specialized workflows for each of the models are created.
+```{r}
+workflow_general <- workflow() %>% #Adding recipe to the general workflow
+  add_recipe(data_recipe) 
+
+workflow_rf <- workflow_general %>% #Adding the models to the workflow
+  add_model(model_rf)
+
+
+
+```
+
+Creating a 5-fold resample with 5 repeats.
+```{r}
+set.seed(1337)
+data_resample <- vfold_cv(data_train_sup, 
+                          strata = Y,
+                          v = 5 ,
+                          repeats = 5)
+```
+
+The parameters for the model is tuned.
+```{r}
+set.seed(1337)
+
+
+#Tuning parameters in the random forest model
+tune_rf <-
+  tune_grid(
+    workflow_rf,
+    resamples = data_resample,
+    grid = 10
+  )
+```
+
+Collecting the best parameters for the model.
+```{r}
+
+
+best_param_rf <- tune_rf %>% select_best(metric = 'rmse') %>%
+      mutate(model = "Random Forest", penalty = "", mixture = "", tree_depth = "", learn_rate="") %>%
+  relocate(model)
+```
+
+Creating the final workflows where the best parameters are added.
+```{r}
+
+workflow_final_rf <- workflow_rf %>%
+  finalize_workflow(parameters = best_param_rf)
+
+```
+
+Fitting the models on the training data.
+```{r}
+
+fit_rf <- workflow_final_rf %>%
+  fit(data_train_sup)
+
+
+```
+
+Gathering all the predicted and observed prices in *pred_collected* in order to calculate root mean squared error for each of the models.
+```{r, warning = FALSE, message = FALSE}
+set.seed(1337)
+pred_collected <- tibble(
+  truth = data_train_sup %>% pull(Y), 
+  base = mean(truth), 
+  rf = fit_rf %>% predict(new_data = data_train_sup) %>% pull(.pred)) %>% 
+  pivot_longer(cols = -truth, 
+               names_to = 'model',
+               values_to = '.pred')
+
+pred_collected %>%
+  group_by(model) %>% 
+  rmse(truth = truth, estimate = .pred) %>% 
+  select(model, .estimate) %>%  
+  arrange(.estimate) 
+```
+The model is used for predictions on the test data set.
+```{r, warning = FALSE, message = FALSE}
+set.seed(1337)
+pred_test <- tibble(
+  truth = actual %>% pull(Y),
+  rf = fit_rf %>% predict(new_data = actual) %>% pull(.pred)) %>% 
+  pivot_longer(cols = -truth,
+               names_to = 'model',
+               values_to = '.pred')
+
+pred_test %>%
+  group_by(model) %>% 
+  rmse(truth = truth, estimate = .pred) %>% 
+  select(model, .estimate) %>%  
+  arrange(.estimate)
+```
+
+The predictions of the random forest model are plotted below. 
+```{r}
+pred_test %>%
+  ggplot(aes(x = truth, y = .pred)) + 
+  geom_abline(lty = 2, color = "gray80", size = 1.5) + 
+  geom_point(alpha = 0.4, size = 0.9, color = "#009E73") +
+  labs(
+    x = "Observed stock price",
+    y = "Predicted stock price")
+      
+```
+The grey line indicates where the predicted values are exual to the observed values. The model seems to underpredict for higher stock prices. 
+
+```{r}
+library(caret)
+
+boruta_output <- Boruta(Y ~ ., data=na.omit(data_train_sup), doTrace=0,pValue = 0.05)
+boruta_signif <- getSelectedAttributes(boruta_output, withTentative = TRUE)
+print(boruta_signif) 
+roughFixMod <- TentativeRoughFix(boruta_output)
+boruta_signif <- getSelectedAttributes(roughFixMod)
+print(boruta_signif)
+imps <- attStats(roughFixMod)
+imps2 = imps[imps$decision != 'Rejected', c('meanImp', 'decision')]
+head(imps2[order(-imps2$meanImp), ])  # descending sort
+plot(boruta_output, cex.axis=.7, las=2, xlab="", main="Variable Importance") 
+
+
+```
+
+```{r}
+write.table(pred_test,file="VESTAS_results.csv")
+```
+
+
+
+
+
+
+
+
